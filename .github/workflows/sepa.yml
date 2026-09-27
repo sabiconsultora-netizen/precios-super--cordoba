@@ -11,7 +11,7 @@ permissions:
 jobs:
   actualizar:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -20,16 +20,53 @@ jobs:
           node-version: '20'
 
       - name: Bajar el último archivo del SEPA
+        shell: python
         run: |
-          set -e
-          API="https://datos.produccion.gob.ar/api/3/action/package_show?id=sepa-precios"
-          URL=$(curl -sL "$API" | jq -r '.result.resources | map(select((.format // "" | test("zip";"i")) or (.url | test("\\.zip$";"i")))) | sort_by(.last_modified // .metadata_modified // .created) | last | .url')
-          echo "Archivo: $URL"
-          test -n "$URL" && test "$URL" != "null"
-          curl -sL --retry 3 -o sepa.zip "$URL"
-          ls -lh sepa.zip
-          mkdir -p sepa && unzip -q -o sepa.zip -d sepa
-          find sepa -name '*.zip' | while read -r z; do d="${z%.zip}"; mkdir -p "$d"; unzip -q -o "$z" -d "$d" || echo "no se pudo abrir $z"; done
+          import json, re, sys, os, zipfile, urllib.request, shutil
+          UA = {'User-Agent': 'Mozilla/5.0 (precios-cordoba; datos abiertos SEPA)'}
+          def get(url, timeout=120):
+              return urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=timeout)
+          url = None
+          # 1) API del portal de datos
+          try:
+              r = json.load(get('https://datos.produccion.gob.ar/api/3/action/package_show?id=sepa-precios'))
+              recs = [x for x in r['result']['resources'] if str(x.get('url','')).lower().endswith('.zip') or 'zip' in str(x.get('format','')).lower()]
+              recs.sort(key=lambda x: x.get('last_modified') or x.get('metadata_modified') or x.get('created') or '')
+              print('Recursos zip encontrados:', len(recs))
+              for x in recs[-7:]: print('  ', x.get('name'), '|', x.get('last_modified') or x.get('created'), '|', x.get('url'))
+              if recs: url = recs[-1]['url']
+          except Exception as e:
+              print('La API no respondió bien:', repr(e))
+          # 2) si no, buscar los links .zip en la página del dataset
+          if not url:
+              try:
+                  html = get('https://datos.produccion.gob.ar/dataset/sepa-precios').read().decode('utf-8', 'ignore')
+                  links = re.findall(r'href="([^"]+\.zip)"', html)
+                  print('Links .zip en la página:', len(links))
+                  if links: url = links[-1]
+              except Exception as e:
+                  print('La página del dataset no respondió:', repr(e))
+          if not url:
+              print('::error::No encontré el archivo del SEPA. El portal puede estar caído o bloqueando la descarga.'); sys.exit(1)
+          print('Bajando:', url)
+          with get(url, timeout=600) as resp, open('sepa.zip', 'wb') as f:
+              shutil.copyfileobj(resp, f, 1024*1024)
+          tam = os.path.getsize('sepa.zip'); print(f'Tamaño: {tam/1e6:.1f} MB')
+          if not zipfile.is_zipfile('sepa.zip'):
+              print('::error::Lo que bajó no es un zip. Primeros bytes:', open('sepa.zip','rb').read(300)); sys.exit(1)
+          # descomprimir, y adentro un zip por comercio
+          os.makedirs('sepa', exist_ok=True)
+          with zipfile.ZipFile('sepa.zip') as z: z.extractall('sepa')
+          n = 0
+          for raiz, _, archivos in os.walk('sepa'):
+              for a in archivos:
+                  if a.lower().endswith('.zip'):
+                      p = os.path.join(raiz, a)
+                      try:
+                          with zipfile.ZipFile(p) as z: z.extractall(p[:-4]); n += 1
+                      except Exception as e:
+                          print('No se pudo abrir', p, repr(e))
+          print('Comercios descomprimidos:', n)
 
       - name: Quedarse con Córdoba
         run: node sepa-cordoba.mjs sepa docs/cordoba.json
