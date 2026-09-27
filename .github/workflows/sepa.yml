@@ -1,0 +1,43 @@
+name: Precios SEPA Córdoba
+
+on:
+  schedule:
+    - cron: '0 12 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  actualizar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Bajar el último archivo del SEPA
+        run: |
+          set -e
+          API="https://datos.produccion.gob.ar/api/3/action/package_show?id=sepa-precios"
+          URL=$(curl -sL "$API" | jq -r '.result.resources | map(select((.format // "" | test("zip";"i")) or (.url | test("\\.zip$";"i")))) | sort_by(.last_modified // .metadata_modified // .created) | last | .url')
+          echo "Archivo: $URL"
+          test -n "$URL" && test "$URL" != "null"
+          curl -sL --retry 3 -o sepa.zip "$URL"
+          ls -lh sepa.zip
+          mkdir -p sepa && unzip -q -o sepa.zip -d sepa
+          find sepa -name '*.zip' | while read -r z; do d="${z%.zip}"; mkdir -p "$d"; unzip -q -o "$z" -d "$d" || echo "no se pudo abrir $z"; done
+
+      - name: Quedarse con Córdoba
+        run: node sepa-cordoba.mjs sepa docs/cordoba.json
+
+      - name: Publicar
+        run: |
+          git config user.name  "sepa-bot"
+          git config user.email "sepa-bot@users.noreply.github.com"
+          git add docs/cordoba.json
+          git diff --cached --quiet || git commit -m "Precios SEPA Córdoba $(date +%F)"
+          git push
